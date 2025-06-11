@@ -12,13 +12,13 @@ import SMB2
 
 /// Provides synchronous operation on SMB2
 final class SMB2Context: CustomDebugStringConvertible, CustomReflectable, @unchecked Sendable {
-    var unsafe: UnsafeMutablePointer<smb2_context>?
+    var context: UnsafeMutablePointer<smb2_context>?
     private var _context_lock = NSRecursiveLock()
     var timeout: TimeInterval
 
     init(timeout: TimeInterval) throws {
         let _context = try smb2_init_context().unwrap()
-        self.unsafe = _context
+        self.context = _context
         self.timeout = timeout
     }
 
@@ -27,7 +27,7 @@ final class SMB2Context: CustomDebugStringConvertible, CustomReflectable, @unche
             try? self.disconnect()
         }
         try? withThreadSafeContext { context in
-            self.unsafe = nil
+            self.context = nil
             smb2_destroy_context(context)
         }
     }
@@ -39,7 +39,7 @@ final class SMB2Context: CustomDebugStringConvertible, CustomReflectable, @unche
         defer {
             _context_lock.unlock()
         }
-        return try handler(unsafe.unwrap())
+        return try handler(context.unwrap())
     }
 
     public var debugDescription: String {
@@ -48,7 +48,7 @@ final class SMB2Context: CustomDebugStringConvertible, CustomReflectable, @unche
 
     public var customMirror: Mirror {
         var c: [(label: String?, value: Any)] = []
-        if unsafe != nil {
+        if context != nil {
             c.append((label: "server", value: server!))
             c.append((label: "securityMode", value: securityMode))
             c.append((label: "authentication", value: authentication))
@@ -69,7 +69,7 @@ final class SMB2Context: CustomDebugStringConvertible, CustomReflectable, @unche
 extension SMB2Context {
     var workstation: String {
         get {
-            (unsafe?.pointee.workstation).map(String.init(cString:)) ?? ""
+            (context?.pointee.workstation).map(String.init(cString:)) ?? ""
         }
         set {
             try? withThreadSafeContext { context in
@@ -80,7 +80,7 @@ extension SMB2Context {
 
     var domain: String {
         get {
-            (unsafe?.pointee.domain).map(String.init(cString:)) ?? ""
+            (context?.pointee.domain).map(String.init(cString:)) ?? ""
         }
         set {
             try? withThreadSafeContext { context in
@@ -91,7 +91,7 @@ extension SMB2Context {
 
     var user: String {
         get {
-            (unsafe?.pointee.user).map(String.init(cString:)) ?? ""
+            (context?.pointee.user).map(String.init(cString:)) ?? ""
         }
         set {
             try? withThreadSafeContext { context in
@@ -102,7 +102,7 @@ extension SMB2Context {
 
     var password: String {
         get {
-            (unsafe?.pointee.password).map(String.init(cString:)) ?? ""
+            (context?.pointee.password).map(String.init(cString:)) ?? ""
         }
         set {
             try? withThreadSafeContext { context in
@@ -113,7 +113,7 @@ extension SMB2Context {
 
     var securityMode: NegotiateSigning {
         get {
-            (unsafe?.pointee.security_mode).flatMap(NegotiateSigning.init(rawValue:)) ?? []
+            (context?.pointee.security_mode).flatMap(NegotiateSigning.init(rawValue:)) ?? []
         }
         set {
             try? withThreadSafeContext { context in
@@ -124,7 +124,7 @@ extension SMB2Context {
 
     var seal: Bool {
         get {
-            unsafe?.pointee.seal ?? 0 != 0
+            context?.pointee.seal ?? 0 != 0
         }
         set {
             try? withThreadSafeContext { context in
@@ -135,7 +135,7 @@ extension SMB2Context {
 
     var authentication: Security {
         get {
-            unsafe?.pointee.sec ?? SMB2_SEC_UNDEFINED
+            context?.pointee.sec ?? SMB2_SEC_UNDEFINED
         }
         set {
             try? withThreadSafeContext { context in
@@ -145,7 +145,7 @@ extension SMB2Context {
     }
 
     var clientGuid: UUID? {
-        guard let guid = try? smb2_get_client_guid(unsafe.unwrap()) else {
+        guard let guid = try? smb2_get_client_guid(context.unwrap()) else {
             return nil
         }
         let uuid = UnsafeRawPointer(guid).assumingMemoryBound(to: uuid_t.self).pointee
@@ -153,15 +153,15 @@ extension SMB2Context {
     }
 
     var server: String? {
-        unsafe?.pointee.server.map(String.init(cString:))
+        context?.pointee.server.map(String.init(cString:))
     }
 
     var share: String? {
-        unsafe?.pointee.share.map(String.init(cString:))
+        context?.pointee.share.map(String.init(cString:))
     }
 
     var version: Version {
-        (unsafe?.pointee.dialect).map { Version(rawValue: UInt32($0)) } ?? .any
+        (context?.pointee.dialect).map { Version(rawValue: UInt32($0)) } ?? .any
     }
 
     var isConnected: Bool {
@@ -170,26 +170,26 @@ extension SMB2Context {
 
     var fileDescriptor: Int32 {
         do {
-            return try smb2_get_fd(unsafe.unwrap())
+            return try smb2_get_fd(context.unwrap())
         } catch {
             return -1
         }
     }
 
     var error: String? {
-        let errorStr = smb2_get_error(unsafe)
+        let errorStr = smb2_get_error(context)
         return errorStr.map(String.init(cString:))
     }
 
     func whichEvents() throws -> Int16 {
-        try Int16(truncatingIfNeeded: smb2_which_events(unsafe.unwrap()))
+        try Int16(truncatingIfNeeded: smb2_which_events(context.unwrap()))
     }
 
     func service(revents: Int32) throws {
-        let result = smb2_service(unsafe, revents)
+        let result = smb2_service(context, revents)
         if result < 0 {
-            unsafe = nil
-            smb2_destroy_context(unsafe)
+            context = nil
+            smb2_destroy_context(context)
         }
         try POSIXError.throwIfError(result, description: error)
     }
