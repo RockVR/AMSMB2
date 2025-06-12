@@ -209,7 +209,7 @@ final class SMB2FileHandle {
     init(fileDescriptor: smb2_file_id, on context: SMB2Context) throws {
         self.context = context
         var fileDescriptor = fileDescriptor
-        self.handle = smb2_fh_from_file_id(context.unsafe, &fileDescriptor)
+        self.handle = smb2_fh_from_file_id(context.context, &fileDescriptor)
     }
 
     private init(_ path: String, flags: Int32, on context: SMB2Context) throws {
@@ -305,7 +305,7 @@ final class SMB2FileHandle {
     @discardableResult
     func lseek(offset: Int64, whence: SeekWhence) throws -> Int64 {
         let handle = try handle.unwrap()
-        let result = smb2_lseek(context.unsafe, handle, offset, whence.rawValue, nil)
+        let result = smb2_lseek(context.context, handle, offset, whence.rawValue, nil)
         try POSIXError.throwIfError(result, description: context.error)
         return result
     }
