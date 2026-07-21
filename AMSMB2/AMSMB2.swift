@@ -1458,7 +1458,12 @@ extension SMB2Manager {
         self.context = context
         initContext(context, encrypted: encrypted)
         let server = url.host! + (url.port.map { ":\($0)" } ?? "")
-        try context.connect(server: server, share: shareName, user: _user)
+        let unsignedGuest = _user.caseInsensitiveCompare("guest") == .orderedSame
+            && _password.isEmpty
+            && !encrypted
+        try context.connect(
+            server: server, share: shareName, user: _user, unsignedGuest: unsignedGuest
+        )
         return context
     }
 
