@@ -219,11 +219,58 @@ extension SMB2Client {
 // MARK: Connectivity
 
 extension SMB2Client {
-    func connect(server: String, share: String, user: String) throws {
+    func connect(server: String, share: String, user: String, unsignedGuest: Bool = false) throws {
+        guard unsignedGuest else {
+            try connectSessionAndShare(server: server, share: share, user: user)
+            return
+        }
+
+        try withThreadSafeContext { context in
+            smb2_set_passthrough(context, 1)
+        }
+        do {
+            try connectSessionAndShare(server: server, share: share, user: user)
+
+            // Guest sessions do not have a usable signing key. Stop libsmb2 from
+            // signing the Tree Connect request after the server maps us to Guest.
+            try withThreadSafeContext { context in
+                smb2_set_sign(context, 0)
+                smb2_set_passthrough(context, 0)
+            }
+            try treeConnect(server: server, share: share)
+        } catch {
+            try? withThreadSafeContext { context in
+                smb2_set_passthrough(context, 0)
+            }
+            throw error
+        }
+    }
+
+    private func connectSessionAndShare(server: String, share: String, user: String) throws {
         try async_await { context, cbPtr -> Int32 in
             smb2_connect_share_async(
                 context, server, share, user, SMB2Client.generic_handler, cbPtr
             )
+        }
+    }
+
+    private func treeConnect(server: String, share: String) throws {
+        var path = Array("\\\\\(server)\\\(share)".utf16).map(\.littleEndian)
+        guard let pathLength = UInt16(exactly: path.count * MemoryLayout<UInt16>.size) else {
+            throw POSIXError(.ENAMETOOLONG)
+        }
+
+        try path.withUnsafeMutableBufferPointer { pathBuffer in
+            var request = smb2_tree_connect_request()
+            request.flags = 0
+            request.path_length = pathLength
+            request.path = pathBuffer.baseAddress
+
+            try async_await_pdu { context, cbPtr in
+                smb2_cmd_tree_connect_async(
+                    context, &request, SMB2Client.generic_handler, cbPtr
+                )
+            }
         }
     }
 

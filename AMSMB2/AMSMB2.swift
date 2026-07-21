@@ -1436,7 +1436,12 @@ extension SMB2Manager {
         self.client = client
         initClient(client, encrypted: encrypted)
         let server = url.host! + (url.port.map { ":\($0)" } ?? "")
-        try client.connect(server: server, share: shareName, user: _user)
+        let unsignedGuest = _user.caseInsensitiveCompare("guest") == .orderedSame
+            && _password.isEmpty
+            && !encrypted
+        try client.connect(
+            server: server, share: shareName, user: _user, unsignedGuest: unsignedGuest
+        )
         return client
     }
 
