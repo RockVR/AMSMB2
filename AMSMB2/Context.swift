@@ -10,15 +10,119 @@
 import Foundation
 import SMB2
 
+final class SMB2CallbackState: @unchecked Sendable {
+    typealias Handler = (_ status: Int32, _ commandData: UnsafeMutableRawPointer?) -> Void
+
+    private let lock = NSLock()
+    private var _result: Int32 = SMB2_STATUS_SUCCESS
+    private var _isFinished = false
+    private var handler: Handler?
+
+    init(handler: @escaping Handler) {
+        self.handler = handler
+    }
+
+    var result: Int32 {
+        lock.withLock { _result }
+    }
+
+    var status: UInt32 {
+        UInt32(bitPattern: result)
+    }
+
+    var isFinished: Bool {
+        lock.withLock { _isFinished }
+    }
+
+    @discardableResult
+    func complete(status: Int32, commandData: UnsafeMutableRawPointer?) -> Bool {
+        lock.withLock {
+            guard !_isFinished else { return false }
+            _result = status
+            handler?(status, commandData)
+            handler = nil
+            _isFinished = true
+            return true
+        }
+    }
+}
+
+final class SMB2RetainedCallback: @unchecked Sendable {
+    let state: SMB2CallbackState
+
+    private let lock = NSLock()
+    private var retainedState: Unmanaged<SMB2CallbackState>?
+
+    init(state: SMB2CallbackState) {
+        self.state = state
+        // libsmb2 may retain this pointer until a normal, timeout, or cancelled callback.
+        // The waiter releases this ownership only after the PDU has reached a terminal path.
+        retainedState = Unmanaged.passRetained(state)
+    }
+
+    var opaquePointer: UnsafeMutableRawPointer {
+        lock.withLock { retainedState!.toOpaque() }
+    }
+
+    func releaseCBarrierOwnership() {
+        let retained = lock.withLock { () -> Unmanaged<SMB2CallbackState>? in
+            defer { retainedState = nil }
+            return retainedState
+        }
+        retained?.release()
+    }
+
+    deinit {
+        releaseCBarrierOwnership()
+    }
+
+    static func complete(
+        opaquePointer: UnsafeMutableRawPointer,
+        status: Int32,
+        commandData: UnsafeMutableRawPointer?
+    ) {
+        let state = Unmanaged<SMB2CallbackState>
+            .fromOpaque(opaquePointer)
+            .takeUnretainedValue()
+        _ = state.complete(status: status, commandData: commandData)
+    }
+}
+
+struct SMB2ContextSystemCalls {
+    var pollOne: (_ descriptor: UnsafeMutablePointer<pollfd>, _ timeoutMilliseconds: Int32) -> Int32
+    var service: (_ context: UnsafeMutablePointer<smb2_context>, _ revents: Int32) -> Int32
+    var destroy: (_ context: UnsafeMutablePointer<smb2_context>) -> Void
+    var setTimeout: (_ context: UnsafeMutablePointer<smb2_context>, _ seconds: Int32) -> Void
+
+    static var live: SMB2ContextSystemCalls { SMB2ContextSystemCalls(
+        pollOne: { descriptor, timeoutMilliseconds in
+            poll(descriptor, 1, timeoutMilliseconds)
+        },
+        service: smb2_service,
+        destroy: smb2_destroy_context,
+        setTimeout: smb2_set_timeout
+    ) }
+}
+
 /// Provides synchronous operation on SMB2
 final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, @unchecked Sendable {
     var context: UnsafeMutablePointer<smb2_context>?
     private var _context_lock = NSRecursiveLock()
-    var timeout: TimeInterval
+    private let systemCalls: SMB2ContextSystemCalls
+    var timeout: TimeInterval {
+        didSet {
+            try? withThreadSafeContext { context in
+                applyTimeout(timeout, to: context)
+            }
+        }
+    }
 
-    init(timeout: TimeInterval) throws {
-        self.context = try smb2_init_context().unwrap()
+    init(timeout: TimeInterval, systemCalls: SMB2ContextSystemCalls = .live) throws {
+        let _context = try smb2_init_context().unwrap()
+        self.context = _context
+        self.systemCalls = systemCalls
         self.timeout = timeout
+        applyTimeout(timeout, to: _context)
     }
 
     deinit {
@@ -27,7 +131,7 @@ final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, @unchec
         }
         try? withThreadSafeContext { context in
             self.context = nil
-            smb2_destroy_context(context)
+            systemCalls.destroy(context)
         }
     }
 
@@ -162,7 +266,7 @@ extension SMB2Client {
     var version: Version {
         (context?.pointee.dialect).map { Version(rawValue: UInt32($0)) } ?? .any
     }
-    
+
     var passthrough: Bool {
         get {
             var result: Int32 = 0
@@ -189,15 +293,15 @@ extension SMB2Client {
     var error: String? {
         smb2_get_error(context).map(String.init(cString:))
     }
-    
+
     var ntError: NTStatus {
         .init(rawValue: smb2_get_nterror(context))
     }
-    
+
     var errno: Int32 {
         ntError.posixErrorCode.rawValue
     }
-    
+
     var maximumTransactionSize: Int {
         (context?.pointee.max_transact_size).map(Int.init) ?? 65535
     }
@@ -207,12 +311,27 @@ extension SMB2Client {
     }
 
     func service(revents: Int32) throws {
-        let result = smb2_service(context, revents)
+        let activeContext = try context.unwrap()
+        let result = systemCalls.service(activeContext, revents)
         if result < 0 {
-            smb2_destroy_context(context)
+            let description = smb2_get_error(activeContext).map(String.init(cString:))
             context = nil
-            try POSIXError.throwIfError(result, description: error)
+            systemCalls.destroy(activeContext)
+            try POSIXError.throwIfError(result, description: description)
         }
+    }
+
+    private func applyTimeout(
+        _ timeout: TimeInterval,
+        to context: UnsafeMutablePointer<smb2_context>
+    ) {
+        let seconds: Int32
+        if timeout <= 0 {
+            seconds = 0
+        } else {
+            seconds = Int32(min(timeout.rounded(.up), TimeInterval(Int32.max)))
+        }
+        systemCalls.setTimeout(context, seconds)
     }
 }
 
@@ -304,6 +423,7 @@ extension SMB2Client {
     func shareEnumSwift() throws -> [SMB2Share] {
         // Connection to server service.
         let srvsvc = try SMB2FileHandle(path: "srvsvc", desiredAccess: [.read, .write], createDisposition: .open, on: self)
+        defer { srvsvc.close() }
         // Bind command
         _ = try srvsvc.write(data: MSRPC.SrvsvcBindData())
         let recvBindData = try srvsvc.pread(offset: 0, length: Int(Int16.max))
@@ -340,9 +460,10 @@ extension SMB2Client {
             smb2_readlink_async(context, path.canonical, SMB2Client.generic_handler, cbPtr)
         }.data
     }
-    
+
     func symlink(_ path: String, to destination: String) throws {
         let file = try SMB2FileHandle(path: path, flags: O_RDWR | O_CREAT | O_EXCL | O_SYMLINK | O_SYNC, on: self)
+        defer { file.close() }
         let reparse = IOCtl.SymbolicLinkReparse(path: destination, isRelative: true)
         try file.fcntl(command: .setReparsePoint, args: reparse)
     }
@@ -362,7 +483,7 @@ extension SMB2Client {
             smb2_rmdir_async(context, path.canonical, SMB2Client.generic_handler, cbPtr)
         }
     }
-    
+
     func unlink(_ path: String, type: smb2_stat_64.ResourceType = .file) throws {
         switch type {
         case .directory:
@@ -373,6 +494,7 @@ extension SMB2Client {
             }
         case .link:
             let file = try SMB2FileHandle(path: path, flags: O_RDWR | O_SYMLINK, on: self)
+            defer { file.close() }
             try file.setInfo(smb2_file_disposition_info(delete_pending: 1), infoClass: .disposition)
         default:
             preconditionFailure("Not supported file type.")
@@ -399,28 +521,46 @@ extension SMB2Client {
 // MARK: Async operation handler
 
 extension SMB2Client {
-    private class CBData {
-        var result: Int32 = .init(NTStatus.success.rawValue)
-        var isFinished: Bool = false
-        var dataHandler: ((UnsafeMutableRawPointer?) -> Void)?
-        var status: NTStatus {
-            NTStatus(rawValue: result)
+    private func invalidateContext(_ activeContext: UnsafeMutablePointer<smb2_context>) {
+        if context == activeContext {
+            context = nil
         }
+        // libsmb2 synchronously cancels queued PDUs while destroying the context.
+        systemCalls.destroy(activeContext)
     }
 
-    private func wait_for_reply(_ cb: inout CBData) throws {
-        let startDate = Date()
-        while !cb.isFinished {
-            var pfd = pollfd()
-            pfd.fd = fileDescriptor
-            pfd.events = try whichEvents()
+    private var systemErrno: Int32 {
+#if canImport(Darwin)
+        Darwin.errno
+#else
+        Glibc.errno
+#endif
+    }
 
-            if pfd.fd < 0 || (poll(&pfd, 1, 1000) < 0 && errno != EAGAIN) {
-                throw POSIXError(.init(errno), description: error)
+    private func wait_for_reply(_ state: SMB2CallbackState) throws {
+        let startDate = Date()
+        while !state.isFinished {
+            let activeContext = try context.unwrap()
+            var pfd = pollfd()
+            pfd.fd = smb2_get_fd(activeContext)
+            pfd.events = Int16(truncatingIfNeeded: smb2_which_events(activeContext))
+
+            let pollResult = systemCalls.pollOne(&pfd, 1000)
+            if pollResult < 0, systemErrno != EAGAIN {
+                let pollError = systemErrno
+                let description = smb2_get_error(activeContext).map(String.init(cString:))
+                invalidateContext(activeContext)
+                throw POSIXError(.init(pollError), description: description)
             }
 
             if pfd.revents == 0 {
-                if timeout > 0, Date().timeIntervalSince(startDate) > timeout {
+                // libsmb2 evaluates PDU deadlines from smb2_service, even without fd events.
+                try service(revents: 0)
+                if state.isFinished {
+                    continue
+                }
+                if timeout > 0, Date().timeIntervalSince(startDate) > timeout + 2 {
+                    invalidateContext(activeContext)
                     throw POSIXError(.ETIMEDOUT)
                 }
                 continue
@@ -432,13 +572,12 @@ extension SMB2Client {
 
     static let generic_handler: smb2_command_cb = { smb2, status, command_data, cbdata in
         do {
-            guard try smb2.unwrap().pointee.fd >= 0 else { return }
-            let cbdata = try cbdata.unwrap().bindMemory(to: CBData.self, capacity: 1).pointee
-            if NTStatus(rawValue: status) != .success {
-                cbdata.result = status
-            }
-            cbdata.dataHandler?(command_data)
-            cbdata.isFinished = true
+            _ = smb2
+            SMB2RetainedCallback.complete(
+                opaquePointer: try cbdata.unwrap(),
+                status: status,
+                commandData: command_data
+            )
         } catch {}
     }
 
@@ -461,22 +600,22 @@ extension SMB2Client {
         throws -> (result: Int32, data: DataType)
     {
         try withThreadSafeContext { context -> (Int32, DataType) in
-            var cb = CBData()
             var resultData: DataType?
             var dataHandlerError: (any Error)?
-            cb.dataHandler = { ptr in
+            let state = SMB2CallbackState { _, ptr in
                 do {
                     resultData = try dataHandler(self, ptr)
                 } catch {
                     dataHandlerError = error
                 }
             }
-            let result = try withUnsafeMutablePointer(to: &cb) { cb in
-                try handler(context, cb)
-            }
+            let callback = SMB2RetainedCallback(state: state)
+            defer { callback.releaseCBarrierOwnership() }
+
+            let result = try handler(context, callback.opaquePointer)
             try POSIXError.throwIfError(result, description: error)
-            try wait_for_reply(&cb)
-            let cbResult = cb.result
+            try wait_for_reply(state)
+            let cbResult = state.result
 
             try POSIXError.throwIfError(cbResult, description: error)
             if let error = dataHandlerError { throw error }
@@ -499,25 +638,26 @@ extension SMB2Client {
         throws -> (status: UInt32, data: DataType)
     {
         try withThreadSafeContext { context -> (UInt32, DataType) in
-            var cb = CBData()
             var resultData: DataType?
             var dataHandlerError: (any Error)?
-            cb.dataHandler = { ptr in
+            let state = SMB2CallbackState { _, ptr in
                 do {
                     resultData = try dataHandler(self, ptr)
                 } catch {
                     dataHandlerError = error
                 }
             }
-            let pdu = try withUnsafeMutablePointer(to: &cb) { cb in
-                try handler(context, cb).unwrap()
-            }
-            smb2_queue_pdu(context, pdu)
-            try wait_for_reply(&cb)
+            let callback = SMB2RetainedCallback(state: state)
+            defer { callback.releaseCBarrierOwnership() }
 
-            try POSIXError.throwIfErrorStatus(cb.status)
+            let pdu = try handler(context, callback.opaquePointer).unwrap()
+            smb2_queue_pdu(context, pdu)
+            try wait_for_reply(state)
+            let status = state.status
+
+            try POSIXError.throwIfErrorStatus(NTStatus(rawValue: status))
             if let error = dataHandlerError { throw error }
-            return try (cb.status.rawValue, resultData.unwrap())
+            return try (status, resultData.unwrap())
         }
     }
 }
@@ -525,14 +665,14 @@ extension SMB2Client {
 extension SMB2Client {
     struct NegotiateSigning: OptionSet, Sendable, CustomStringConvertible {
         var rawValue: UInt16
-        
+
         var description: String {
             var result: [String] = []
             if contains(.enabled) { result.append("Enabled") }
             if contains(.required) { result.append("Required") }
             return result.joined(separator: ", ")
         }
-        
+
         static let enabled = NegotiateSigning(rawValue: SMB2_NEGOTIATE_SIGNING_ENABLED)
         static let required = NegotiateSigning(rawValue: SMB2_NEGOTIATE_SIGNING_REQUIRED)
     }
@@ -550,7 +690,7 @@ extension SMB2.smb2_negotiate_version: Swift.Hashable, Swift.CustomStringConvert
     static let v3_00 = SMB2_VERSION_0300
     static let v3_02 = SMB2_VERSION_0302
     static let v3_11 = SMB2_VERSION_0311
-    
+
     public var description: String {
         switch self {
         case .any: return "Any"
@@ -578,7 +718,7 @@ extension SMB2.smb2_sec: Swift.Hashable, Swift.CustomStringConvertible {
     static let undefined = SMB2_SEC_UNDEFINED
     static let ntlmSsp = SMB2_SEC_NTLMSSP
     static let kerberos5 = SMB2_SEC_KRB5
-    
+
     public var description: String {
         switch self {
         case .undefined: return "Undefined"
@@ -628,7 +768,7 @@ struct NTStatus: LocalizedError, Hashable, Sendable {
         case info
         case warning
         case error
-        
+
         var description: String {
             switch self {
             case .success: return "Success"
@@ -637,7 +777,7 @@ struct NTStatus: LocalizedError, Hashable, Sendable {
             case .error: return "Error"
             }
         }
-        
+
         init(status: NTStatus) {
             self = switch status.rawValue & SMB2_STATUS_SEVERITY_MASK {
             case UInt32(bitPattern: SMB2_STATUS_SEVERITY_SUCCESS):
@@ -653,28 +793,28 @@ struct NTStatus: LocalizedError, Hashable, Sendable {
             }
         }
     }
-    
+
     let rawValue: UInt32
-    
+
     init(rawValue: UInt32) {
         self.rawValue = rawValue
     }
-    
+
     init(rawValue: Int32) {
         self.rawValue = .init(bitPattern: rawValue)
     }
-    
+
     var errorDescription: String? {
         nterror_to_str(rawValue).map(String.init(cString:))
     }
-    
+
     var posixErrorCode: POSIXErrorCode {
         .init(nterror_to_errno(rawValue))
     }
-    
+
     var severity: Severity {
         .init(status: self)
     }
-    
+
     static let success = Self(rawValue: SMB2_STATUS_SUCCESS)
 }
