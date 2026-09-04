@@ -492,6 +492,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
                 // `libsmb2` can not read symlink attributes using `stat`, so if we get
                 // the related error, we simply open file as reparse point then use `fstat`.
                 let file = try SMB2FileHandle.open(path: path, flags: O_RDONLY | O_SYMLINK, on: context)
+                defer { file.close() }
                 stat = try file.fstat()
             }
             var result = [URLResourceKey: Any]()
@@ -578,6 +579,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         
         with(completionHandler: completionHandler) { [stat, smb2Attributes] context in
             let file = try SMB2FileHandle(forUpdatingAtPath: path, on: context)
+            defer { file.close() }
             try file.set(stat: stat, attributes: smb2Attributes)
         }
     }
@@ -770,6 +772,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
                 // `libsmb2` can not read symlink attributes using `stat`, so if we get
                 // the related error, we simply open file as reparse point then use `fstat`.
                 let file = try SMB2FileHandle.open(path: path, flags: O_RDONLY | O_SYMLINK, on: context)
+                defer { file.close() }
                 stat = try file.fstat()
             }
             switch Int32(stat.smb2_type) {
@@ -951,6 +954,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     ) {
         with(completionHandler: completionHandler) { context in
             let file = try SMB2FileHandle(forReadingAtPath: path, on: context)
+            defer { file.close() }
             let size = try Int64(file.fstat().smb2_size)
 
             var shouldContinue = true
@@ -1004,6 +1008,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             var offset = range.lowerBound
             do {
                 let file = try SMB2FileHandle(forReadingAtPath: path, on: context)
+                defer { file.close() }
                 try file.lseek(offset: range.lowerBound, whence: .set)
                 while offset < range.upperBound {
                     let data = try file.read()
@@ -1614,6 +1619,7 @@ extension SMB2Manager {
         context: SMB2Context, fromPath path: String, toPath: String, progress: CopyProgressHandler
     ) throws -> Int64? {
         let fileSource = try SMB2FileHandle(forReadingAtPath: path, on: context)
+        defer { fileSource.close() }
         let size = try Int64(fileSource.fstat().smb2_size)
         let sourceKey: IOCtl.RequestResumeKey = try fileSource.fcntl(command: .srvRequestResumeKey)
         // TODO: Get chunk size from server
@@ -1625,6 +1631,7 @@ extension SMB2Manager {
             )
         }
         let fileDest = try SMB2FileHandle(forCreatingIfNotExistsAtPath: toPath, on: context)
+        defer { fileDest.close() }
         var shouldContinue = true
         for chunk in chunkArray {
             let chunkCopy = IOCtl.SrvCopyChunkCopy(sourceKey: sourceKey.resumeKey, chunks: [chunk])
@@ -1645,8 +1652,10 @@ extension SMB2Manager {
         context: SMB2Context, fromPath path: String, toPath: String, progress: CopyProgressHandler
     ) throws -> Int64? {
         let fileRead = try SMB2FileHandle(forReadingAtPath: path, on: context)
+        defer { fileRead.close() }
         let size = try Int64(fileRead.fstat().smb2_size)
         let fileWrite = try SMB2FileHandle(forCreatingIfNotExistsAtPath: toPath, on: context)
+        defer { fileWrite.close() }
         var shouldContinue = true
         var written = 0
         while shouldContinue {
@@ -1690,6 +1699,7 @@ extension SMB2Manager {
         to stream: OutputStream, progress: ReadProgressHandler
     ) throws {
         let file = try SMB2FileHandle(forReadingAtPath: path, on: context)
+        defer { file.close() }
         let filesize = try Int64(file.fstat().smb2_size)
         let length = range.upperBound - range.lowerBound
         let size = min(length, filesize - range.lowerBound)
@@ -1732,6 +1742,7 @@ extension SMB2Manager {
         } else {
             file = try SMB2FileHandle(forCreatingIfNotExistsAtPath: toPath, on: context)
         }
+        defer { file.close() }
         let chunkSize = chunkSize > 0 ? chunkSize : file.optimizedWriteSize
         var totalWritten: UInt64 = 0
 

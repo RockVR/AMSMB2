@@ -12,6 +12,33 @@ import SMB2
 
 typealias smb2fh = OpaquePointer
 
+final class SMB2FileHandleState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var handle: smb2fh?
+
+    init(handle: smb2fh?) {
+        self.handle = handle
+    }
+
+    var isClosed: Bool {
+        lock.withLock { handle == nil }
+    }
+
+    func withOpenHandle<R>(_ operation: (smb2fh) throws -> R) throws -> R {
+        try lock.withLock {
+            try operation(handle.unwrap())
+        }
+    }
+
+    func close(_ operation: (smb2fh) -> Void) {
+        let openHandle = lock.withLock { () -> smb2fh? in
+            defer { handle = nil }
+            return handle
+        }
+        openHandle.map(operation)
+    }
+}
+
 final class SMB2FileHandle {
     struct SeekWhence: RawRepresentable {
         var rawValue: Int32
@@ -98,7 +125,7 @@ final class SMB2FileHandle {
     }
 
     private var context: SMB2Context
-    private var handle: smb2fh?
+    private var state: SMB2FileHandleState
 
     convenience init(forReadingAtPath path: String, on context: SMB2Context) throws {
         try self.init(path, flags: O_RDONLY, on: context)
@@ -209,7 +236,9 @@ final class SMB2FileHandle {
     init(fileDescriptor: smb2_file_id, on context: SMB2Context) throws {
         self.context = context
         var fileDescriptor = fileDescriptor
-        self.handle = smb2_fh_from_file_id(context.context, &fileDescriptor)
+        self.state = SMB2FileHandleState(
+            handle: smb2_fh_from_file_id(context.context, &fileDescriptor)
+        )
     }
 
     private init(_ path: String, flags: Int32, on context: SMB2Context) throws {
@@ -218,78 +247,78 @@ final class SMB2FileHandle {
             smb2_open_async(context, path.canonical, flags, SMB2Context.generic_handler, cbPtr)
         }
         self.context = context
-        self.handle = handle
+        self.state = SMB2FileHandleState(handle: handle)
     }
 
     deinit {
-        do {
-            let handle = try self.handle.unwrap()
-            try context.async_await { context, cbPtr -> Int32 in
-                smb2_close_async(context, handle, SMB2Context.generic_handler, cbPtr)
-            }
-        } catch {}
+        close()
     }
 
     var fileId: UUID {
-        .init(uuid: (try? smb2_get_file_id(handle.unwrap()).unwrap().pointee) ?? compound_file_id)
+        (try? state.withOpenHandle { handle in
+            .init(uuid: smb2_get_file_id(handle).pointee)
+        }) ?? .init(uuid: compound_file_id)
     }
 
     func close() {
-        guard let handle = handle else { return }
-        self.handle = nil
-        _ = try? context.withThreadSafeContext { context in
-            smb2_close(context, handle)
+        state.close { handle in
+            _ = try? context.withThreadSafeContext { context in
+                smb2_close(context, handle)
+            }
         }
     }
 
     func fstat() throws -> smb2_stat_64 {
-        let handle = try handle.unwrap()
-        var st = smb2_stat_64()
-        try context.async_await { context, cbPtr -> Int32 in
-            smb2_fstat_async(context, handle, &st, SMB2Context.generic_handler, cbPtr)
+        try state.withOpenHandle { handle in
+            var st = smb2_stat_64()
+            try context.async_await { context, cbPtr -> Int32 in
+                smb2_fstat_async(context, handle, &st, SMB2Context.generic_handler, cbPtr)
+            }
+            return st
         }
-        return st
     }
     
     func set(stat: smb2_stat_64, attributes: Attributes) throws {
-        let handle = try handle.unwrap()
-        try context.async_await_pdu(dataHandler: EmptyReply.init) {
-            context, cbPtr -> UnsafeMutablePointer<smb2_pdu>? in
-            var bfi = smb2_file_basic_info(
-                creation_time: smb2_timeval(
-                    tv_sec: .init(stat.smb2_btime),
-                    tv_usec: .init(stat.smb2_btime_nsec / 1000)
-                ),
-                last_access_time: smb2_timeval(
-                    tv_sec: .init(stat.smb2_atime),
-                    tv_usec: .init(stat.smb2_atime_nsec / 1000)
-                ),
-                last_write_time: smb2_timeval(
-                    tv_sec: .init(stat.smb2_mtime),
-                    tv_usec: .init(stat.smb2_mtime_nsec / 1000)
-                ),
-                change_time: smb2_timeval(
-                    tv_sec: .init(stat.smb2_ctime),
-                    tv_usec: .init(stat.smb2_ctime_nsec / 1000)
-                ),
-                file_attributes: attributes.rawValue
-            )
-            
-            var req = smb2_set_info_request()
-            req.file_id = smb2_get_file_id(handle).pointee
-            req.info_type = .init(SMB2_0_INFO_FILE)
-            req.file_info_class = .init(SMB2_FILE_BASIC_INFORMATION)
-            return withUnsafeMutablePointer(to: &bfi) { bfi in
-                req.input_data = .init(bfi)
-                return smb2_cmd_set_info_async(context, &req, SMB2Context.generic_handler, cbPtr)
+        try state.withOpenHandle { handle in
+            _ = try context.async_await_pdu(dataHandler: EmptyReply.init) {
+                context, cbPtr -> UnsafeMutablePointer<smb2_pdu>? in
+                var bfi = smb2_file_basic_info(
+                    creation_time: smb2_timeval(
+                        tv_sec: .init(stat.smb2_btime),
+                        tv_usec: .init(stat.smb2_btime_nsec / 1000)
+                    ),
+                    last_access_time: smb2_timeval(
+                        tv_sec: .init(stat.smb2_atime),
+                        tv_usec: .init(stat.smb2_atime_nsec / 1000)
+                    ),
+                    last_write_time: smb2_timeval(
+                        tv_sec: .init(stat.smb2_mtime),
+                        tv_usec: .init(stat.smb2_mtime_nsec / 1000)
+                    ),
+                    change_time: smb2_timeval(
+                        tv_sec: .init(stat.smb2_ctime),
+                        tv_usec: .init(stat.smb2_ctime_nsec / 1000)
+                    ),
+                    file_attributes: attributes.rawValue
+                )
+
+                var req = smb2_set_info_request()
+                req.file_id = smb2_get_file_id(handle).pointee
+                req.info_type = .init(SMB2_0_INFO_FILE)
+                req.file_info_class = .init(SMB2_FILE_BASIC_INFORMATION)
+                return withUnsafeMutablePointer(to: &bfi) { bfi in
+                    req.input_data = .init(bfi)
+                    return smb2_cmd_set_info_async(context, &req, SMB2Context.generic_handler, cbPtr)
+                }
             }
         }
     }
 
     func ftruncate(toLength: UInt64) throws {
-        let handle = try handle.unwrap()
-        try context.async_await { context, cbPtr -> Int32 in
-            smb2_ftruncate_async(context, handle, toLength, SMB2Context.generic_handler, cbPtr)
+        try state.withOpenHandle { handle in
+            _ = try context.async_await { context, cbPtr -> Int32 in
+                smb2_ftruncate_async(context, handle, toLength, SMB2Context.generic_handler, cbPtr)
+            }
         }
     }
 
@@ -304,10 +333,13 @@ final class SMB2FileHandle {
 
     @discardableResult
     func lseek(offset: Int64, whence: SeekWhence) throws -> Int64 {
-        let handle = try handle.unwrap()
-        let result = smb2_lseek(context.context, handle, offset, whence.rawValue, nil)
-        try POSIXError.throwIfError(result, description: context.error)
-        return result
+        try state.withOpenHandle { handle in
+            try context.withThreadSafeContext { context in
+                let result = smb2_lseek(context, handle, offset, whence.rawValue, nil)
+                try POSIXError.throwIfError(result, description: self.context.error)
+                return result
+            }
+        }
     }
 
     func read(length: Int = 0) throws -> Data {
@@ -315,14 +347,15 @@ final class SMB2FileHandle {
             length <= UInt32.max, "Length bigger than UInt32.max can't be handled by libsmb2."
         )
 
-        let handle = try handle.unwrap()
         let count = length > 0 ? length : optimizedReadSize
         var buffer = Data(repeating: 0, count: count)
-        let result = try buffer.withUnsafeMutableBytes { buffer in
-            try context.async_await { context, cbPtr -> Int32 in
-                smb2_read_async(
-                    context, handle, buffer.baseAddress, .init(buffer.count), SMB2Context.generic_handler, cbPtr
-                )
+        let result = try state.withOpenHandle { handle in
+            try buffer.withUnsafeMutableBytes { buffer in
+                try context.async_await { context, cbPtr -> Int32 in
+                    smb2_read_async(
+                        context, handle, buffer.baseAddress, .init(buffer.count), SMB2Context.generic_handler, cbPtr
+                    )
+                }
             }
         }
         return Data(buffer.prefix(Int(result)))
@@ -333,15 +366,16 @@ final class SMB2FileHandle {
             length <= UInt32.max, "Length bigger than UInt32.max can't be handled by libsmb2."
         )
 
-        let handle = try handle.unwrap()
         let count = length > 0 ? length : optimizedReadSize
         var buffer = Data(repeating: 0, count: count)
-        let result = try buffer.withUnsafeMutableBytes { buffer in
-            try context.async_await { context, cbPtr -> Int32 in
-                smb2_pread_async(
-                    context, handle, buffer.baseAddress, .init(buffer.count), offset, SMB2Context.generic_handler,
-                    cbPtr
-                )
+        let result = try state.withOpenHandle { handle in
+            try buffer.withUnsafeMutableBytes { buffer in
+                try context.async_await { context, cbPtr -> Int32 in
+                    smb2_pread_async(
+                        context, handle, buffer.baseAddress, .init(buffer.count), offset, SMB2Context.generic_handler,
+                        cbPtr
+                    )
+                }
             }
         }
         return buffer.prefix(Int(result))
@@ -360,12 +394,13 @@ final class SMB2FileHandle {
             data.count <= Int32.max, "Data bigger than Int32.max can't be handled by libsmb2."
         )
 
-        let handle = try handle.unwrap()
-        let result = try Data(data).withUnsafeBytes { buffer in
-            try context.async_await { context, cbPtr -> Int32 in
-                smb2_write_async(
-                    context, handle, buffer.baseAddress, .init(buffer.count), SMB2Context.generic_handler, cbPtr
-                )
+        let result = try state.withOpenHandle { handle in
+            try Data(data).withUnsafeBytes { buffer in
+                try context.async_await { context, cbPtr -> Int32 in
+                    smb2_write_async(
+                        context, handle, buffer.baseAddress, .init(buffer.count), SMB2Context.generic_handler, cbPtr
+                    )
+                }
             }
         }
 
@@ -377,13 +412,14 @@ final class SMB2FileHandle {
             data.count <= Int32.max, "Data bigger than Int32.max can't be handled by libsmb2."
         )
 
-        let handle = try handle.unwrap()
-        let result = try Data(data).withUnsafeBytes { buffer in
-            try context.async_await { context, cbPtr -> Int32 in
-                smb2_pwrite_async(
-                    context, handle, buffer.baseAddress, .init(buffer.count), offset, SMB2Context.generic_handler,
-                    cbPtr
-                )
+        let result = try state.withOpenHandle { handle in
+            try Data(data).withUnsafeBytes { buffer in
+                try context.async_await { context, cbPtr -> Int32 in
+                    smb2_pwrite_async(
+                        context, handle, buffer.baseAddress, .init(buffer.count), offset, SMB2Context.generic_handler,
+                        cbPtr
+                    )
+                }
             }
         }
 
@@ -391,22 +427,24 @@ final class SMB2FileHandle {
     }
 
     func fsync() throws {
-        let handle = try handle.unwrap()
-        try context.async_await { context, cbPtr -> Int32 in
-            smb2_fsync_async(context, handle, SMB2Context.generic_handler, cbPtr)
+        try state.withOpenHandle { handle in
+            _ = try context.async_await { context, cbPtr -> Int32 in
+                smb2_fsync_async(context, handle, SMB2Context.generic_handler, cbPtr)
+            }
         }
     }
     
     func changeNotify(watchTree: Bool, filter: ChangeNotifyFilter) throws {
-        let handle = try handle.unwrap()
-        try context.async_await_pdu { context, cbPtr in
-            var request = smb2_change_notify_request(
-                flags: UInt16(watchTree ? SMB2_CHANGE_NOTIFY_WATCH_TREE : 0),
-                output_buffer_length: 0,
-                file_id: smb2_get_file_id(handle).pointee,
-                completion_filter: filter.rawValue
-            )
-            return smb2_cmd_change_notify_async(context, &request, SMB2Context.generic_handler, cbPtr)
+        try state.withOpenHandle { handle in
+            _ = try context.async_await_pdu { context, cbPtr in
+                var request = smb2_change_notify_request(
+                    flags: UInt16(watchTree ? SMB2_CHANGE_NOTIFY_WATCH_TREE : 0),
+                    output_buffer_length: 0,
+                    file_id: smb2_get_file_id(handle).pointee,
+                    completion_filter: filter.rawValue
+                )
+                return smb2_cmd_change_notify_async(context, &request, SMB2Context.generic_handler, cbPtr)
+            }
         }
     }
 
@@ -415,21 +453,23 @@ final class SMB2FileHandle {
         command: IOCtl.Command, args: DataType, needsReply _: Bool = true
     ) throws -> R {
         var inputBuffer = [UInt8](args)
-        return try inputBuffer.withUnsafeMutableBytes { buf in
-            var req = smb2_ioctl_request(
-                ctl_code: command.rawValue,
-                file_id: fileId.uuid,
-                input_offset: 0, input_count: .init(buf.count),
-                max_input_response: 0,
-                output_offset: 0, output_count: .max,
-                max_output_response: 65535,
-                flags: .init(SMB2_0_IOCTL_IS_FSCTL),
-                input: buf.baseAddress
-            )
-            return try context.async_await_pdu(dataHandler: R.init) {
-                context, cbPtr -> UnsafeMutablePointer<smb2_pdu>? in
-                smb2_cmd_ioctl_async(context, &req, SMB2Context.generic_handler, cbPtr)
-            }.data
+        return try state.withOpenHandle { handle in
+            try inputBuffer.withUnsafeMutableBytes { buf in
+                var req = smb2_ioctl_request(
+                    ctl_code: command.rawValue,
+                    file_id: smb2_get_file_id(handle).pointee,
+                    input_offset: 0, input_count: .init(buf.count),
+                    max_input_response: 0,
+                    output_offset: 0, output_count: .max,
+                    max_output_response: 65535,
+                    flags: .init(SMB2_0_IOCTL_IS_FSCTL),
+                    input: buf.baseAddress
+                )
+                return try context.async_await_pdu(dataHandler: R.init) {
+                    context, cbPtr -> UnsafeMutablePointer<smb2_pdu>? in
+                    smb2_cmd_ioctl_async(context, &req, SMB2Context.generic_handler, cbPtr)
+                }.data
+            }
         }
     }
 
