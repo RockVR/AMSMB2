@@ -123,6 +123,14 @@ final class CallbackLifetimeTests: XCTestCase {
         XCTAssertEqual(configuredTimeouts, [2, 0])
     }
 
+    func testEmptyPasswordUsesAbsentPasswordAndPreservesNonemptyPassword() throws {
+        let client = try SMB2Client(timeout: 5)
+        client.password = "secret"
+        XCTAssertEqual(client.password, "secret")
+        client.password = ""
+        XCTAssertNil(client.context?.pointee.password)
+    }
+
     func testFileHandleCloseRunsExactlyOnce() {
         let state = SMB2FileHandleState(handle: OpaquePointer(bitPattern: 0x1234))
         var closedHandles: [OpaquePointer] = []

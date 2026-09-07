@@ -38,7 +38,10 @@ Task {
    require(memory < baseline + 16*1024*1024,"read responses accumulated after disconnect")
   }
   let guest=SMB2Manager(url:URL(string:"smb://127.0.0.1:\(port)")!,credential:URLCredential(user:"guest",password:"",persistence:.none))!
+  guest.timeout = 5
+  print("guest connecting");fflush(stdout)
   try await guest.connectShare(name:"fixture")
+  print("guest reading");fflush(stdout)
   let guestData=try await guest.contents(atPath:"data.bin",range:UInt64(13)..<UInt64(270))
   require(guestData == expected(13,257),"unsigned guest read")
   try await guest.disconnectShare(gracefully:true)

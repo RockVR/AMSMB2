@@ -10,7 +10,7 @@ cleanup() { if [[ -n "$server_pid" ]]; then kill "$server_pid" 2>/dev/null || tr
 trap cleanup EXIT
 swift build --package-path "$root" --product AMSMB2
 bin=$(swift build --package-path "$root" --show-bin-path)
-swiftc -I"$bin/Modules" -I"$root/Dependencies/libsmb2/include" -L"$bin" -lAMSMB2 \
+swiftc -O -I"$bin/Modules" -I"$root/Dependencies/libsmb2/include" -L"$bin" -lAMSMB2 \
   -Xlinker -rpath -Xlinker "$bin" "$root/Tests/ReadMemoryRegression.swift" -o "$out/probe"
 "$python" "$root/Tests/read_memory_fixture.py" "$out" >"$out/server.log" 2>&1 &
 server_pid=$!

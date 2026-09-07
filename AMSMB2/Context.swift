@@ -209,7 +209,7 @@ extension SMB2Client {
         }
         set {
             try? withThreadSafeContext { context in
-                smb2_set_password(context, newValue)
+                smb2_set_password(context, newValue.isEmpty ? nil : newValue)
             }
         }
     }
