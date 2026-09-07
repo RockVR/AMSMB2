@@ -111,3 +111,22 @@ You **must** link this library dynamically to your app if you intend to distribu
 [platform-url]: https://swiftpackageindex.com/amosavian/AMSMB2
 [release-image]: https://img.shields.io/github/release/amosavian/AMSMB2.svg
 [release-url]: https://github.com/amosavian/AMSMB2/releases
+
+## Moon Player read-response lifetime regression
+
+The pinned libsmb2 response parser allocates a separate raw read-reply copy.
+The high-level read callback now releases that copy before invoking user code;
+the caller's receive buffer and the raw API's ownership are unchanged.
+Source: Moon Player AVP local reproduction on 2026-09-07 (repeated playback
+open/close and sustained memory growth).
+
+- PR quick: `bash Dependencies/libsmb2/tests/test-read-reply-lifetime.sh`
+- Existing callback contracts: `swift test --filter CallbackLifetimeTests`
+- Release I/O and memory: `SMB_FIXTURE_PYTHON=/path/to/python-with-impacket bash Scripts/test-read-memory.sh`
+
+The release test uses a loopback-only SMB2 fixture with generated data and test
+credentials. Three connections each read 40 four-MiB blocks, check the full
+content, short tail reads, EOF and error recovery, and enforce a 16 MiB retained
+allocation allowance. No personal NAS or running App/Simulator is touched.
+App integration must additionally run its SMB release build and device playback
+checks; this dependency test does not establish all playback paths are fixed.
