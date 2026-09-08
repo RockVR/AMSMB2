@@ -40,7 +40,7 @@ let package = Package(
             publicHeadersPath: "include",
             cSettings: [
                 .headerSearchPath("include"),
-                .headerSearchPath("include/apple", .when(platforms: [.iOS, .macOS, .macCatalyst, .tvOS, .watchOS])),
+                .headerSearchPath("include/apple", .when(platforms: [.iOS, .macOS, .macCatalyst, .tvOS, .watchOS, .visionOS])),
                 .headerSearchPath("include/smb2"),
                 .headerSearchPath("lib"),
                 .define("_U_", to: "__attribute__((unused))"),

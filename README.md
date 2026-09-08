@@ -105,3 +105,8 @@ You **must** link this library dynamically to your app if you intend to distribu
 [license-url]: LICENSE
 [release-image]: https://img.shields.io/github/release/amosavian/AMSMB2.svg
 [release-url]: https://github.com/amosavian/AMSMB2/releases
+
+## Moon Player 升级候选
+
+本分支基于 4.0.3，保留 guest 和生命周期保护，固定兼容的 libsmb2。
+测试入口、已知边界及升级依据见 [升级回归](Tests/upgrade-regression.md)。

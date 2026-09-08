@@ -494,6 +494,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
                 // `libsmb2` can not read symlink attributes using `stat`, so if we get
                 // the related error, we simply open file as reparse point then use `fstat`.
                 let file = try SMB2FileHandle(path: path, flags: O_RDONLY | O_SYMLINK, on: client)
+                defer { file.close() }
                 stat = try file.fstat()
             }
             var result = [URLResourceKey: any Sendable]()
@@ -516,10 +517,10 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             attributesOfItem(atPath: path, completionHandler: asyncHandler(continuation))
         }
     }
-    
+
     /**
      Sets the attributes of the specified file or directory.
-     
+
      - Parameters:
        - attributes: A dictionary containing as keys the attributes to set for path
             and as values the corresponding value for the attribute.
@@ -573,20 +574,21 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
                 break
             }
         }
-        
+
         if smb2Attributes.subtracting(.normal) != [] {
             smb2Attributes.remove(.normal)
         }
-        
+
         with(completionHandler: completionHandler) { [stat, smb2Attributes] client in
             let file = try SMB2FileHandle(forUpdatingAtPath: path, on: client)
+            defer { file.close() }
             try file.set(stat: stat, attributes: smb2Attributes)
         }
     }
-    
+
     /**
      Sets the attributes of the specified file or directory.
-     
+
      - Parameters:
        - attributes: A dictionary containing as keys the attributes to set for path
             and as values the corresponding value for the attribute.
@@ -602,10 +604,10 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             setAttributes(attributes: attributes, ofItemAtPath: path, completionHandler: asyncHandler(continuation))
         }
     }
-    
+
     /**
      Creates a new symbolic link pointed to given destination.
-     
+
      - Parameters:
        - path: The path of a file or directory.
        - destination:  Item that symbolic link will point to.
@@ -768,6 +770,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
                 // `libsmb2` can not read symlink attributes using `stat`, so if we get
                 // the related error, we simply open file as reparse point then use `fstat`.
                 let file = try SMB2FileHandle(path: path, flags: O_RDONLY | O_SYMLINK, on: client)
+                defer { file.close() }
                 stat = try file.fstat()
             }
             switch stat.resourceType {
@@ -944,6 +947,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     ) {
         with(completionHandler: completionHandler) { client in
             let file = try SMB2FileHandle(forReadingAtPath: path, on: client)
+            defer { file.close() }
             let size = try Int64(file.fstat().smb2_size)
 
             var shouldContinue = true
@@ -972,7 +976,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             )
         }
     }
-    
+
     /**
      Fetches data contents of a file from an offset with specified length. With reporting progress
      on about every 1MiB.
@@ -991,12 +995,13 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     ) -> AsyncThrowingStream<Data, any Error> where R.Bound: FixedWidthInteger {
         let range = range?.int64Range ?? 0..<Int64.max
         let (result, continuation) = AsyncThrowingStream<Data, any Error>.makeStream(bufferingPolicy: .unbounded)
-        
+
         queue { [client] in
             guard let client = client else { return }
             var offset = range.lowerBound
             do {
                 let file = try SMB2FileHandle(forReadingAtPath: path, on: client)
+                defer { file.close() }
                 try file.lseek(offset: range.lowerBound, whence: .set)
                 while offset < range.upperBound {
                     // Read optimal read size, or less if less is remaining.
@@ -1017,7 +1022,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         }
         return result
     }
-    
+
     /**
      Creates and writes data to file. With reporting progress on about every 1MiB.
 
@@ -1067,10 +1072,10 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             )
         }
     }
-    
+
     /**
      Creates/Opens and writes data to file at given offset. With reporting progress on about every 1MiB.
-     
+
      - Important: If file size is greater than offset, contents after offset shall be truncated.
          If file size is less than offset, file size will be increased to the offset first.
 
@@ -1100,7 +1105,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
 
     /**
      Creates/Opens and writes data to file at given offset. With reporting progress on about every 1MiB.
-     
+
      - Important: If file size is greater than offset, contents after offset shall be truncated.
          If file size is less than offset, file size will be increased to the offset first.
 
@@ -1136,7 +1141,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
      - Parameters:
        - stream: input stream that provides data to be written to file.
        - toPath: path of file to be written.
-       - chunkSize: optimized chunk size to read from stream. Default value is abount 1MB.
+       - chunkSize: optimized chunk size to read from stream. Default value is about 1MB.
        - progress: reports progress of written bytes count so far.
            User must return `true` if they want to continuing or `false` to abort writing.
        - bytes: written bytes count.
@@ -1146,7 +1151,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         stream: S, toPath path: String,
         chunkSize: Int = 0, progress: WriteProgressHandler,
         completionHandler: SimpleCompletionHandler
-    ) where S: AsyncSequence & Sendable, S.Element: DataProtocol {
+    ) where S: AsyncSequence & Sendable, S.Element: DataProtocol, S: SendableMetatype, S.Element: SendableMetatype, S.AsyncIterator: SendableMetatype {
         with(completionHandler: completionHandler) { client in
             try self.write(
                 client: client, from: AsyncInputStream(stream: stream), toPath: path, chunkSize: chunkSize,
@@ -1165,14 +1170,14 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
      - Parameters:
        - stream: input stream that provides data to be written to file.
        - toPath: path of file to be written.
-       - chunkSize: optimized chunk size to read from stream. Default value is abount 1MB.
+       - chunkSize: optimized chunk size to read from stream. Default value is about 1MB.
        - progress: reports progress of written bytes count so far.
            User must return `true` if they want to continuing or `false` to abort writing.
        - bytes: written bytes count.
      */
     open func write<S>(
         stream: S, toPath path: String, progress: WriteProgressHandler
-    ) async throws where S: AsyncSequence & Sendable, S.Element: DataProtocol {
+    ) async throws where S: AsyncSequence & Sendable, S.Element: DataProtocol, S: SendableMetatype, S.Element: SendableMetatype, S.AsyncIterator: SendableMetatype {
         try await withCheckedThrowingContinuation { continuation in
             write(
                 stream: stream, toPath: path, progress: progress,
@@ -1365,7 +1370,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             )
         }
     }
-    
+
     /// Monitor file/folder for changes and calls `completionHandler` when a change occurs.
     ///
     /// - Parameters:
@@ -1391,7 +1396,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             return try file.changeNotify(for: filter)
         }
     }
-    
+
     /// Monitor file/folder for changes and returns when a change occurs.
     ///
     /// - Parameters:
@@ -1436,7 +1441,12 @@ extension SMB2Manager {
         self.client = client
         initClient(client, encrypted: encrypted)
         let server = url.host! + (url.port.map { ":\($0)" } ?? "")
-        try client.connect(server: server, share: shareName, user: _user)
+        let unsignedGuest = _user.caseInsensitiveCompare("guest") == .orderedSame
+            && _password.isEmpty
+            && !encrypted
+        try client.connect(
+            server: server, share: shareName, user: _user, unsignedGuest: unsignedGuest
+        )
         return client
     }
 
@@ -1587,6 +1597,7 @@ extension SMB2Manager {
         client: SMB2Client, fromPath path: String, toPath: String, progress: CopyProgressHandler
     ) throws -> Int64? {
         let fileSource = try SMB2FileHandle(forReadingAtPath: path, on: client)
+        defer { fileSource.close() }
         let size = try Int64(fileSource.fstat().smb2_size)
         let sourceKey: IOCtl.RequestResumeKey = try fileSource.fcntl(command: .srvRequestResumeKey)
         // TODO: Get chunk size from server
@@ -1598,6 +1609,7 @@ extension SMB2Manager {
             )
         }
         let fileDest = try SMB2FileHandle(forCreatingIfNotExistsAtPath: toPath, on: client)
+        defer { fileDest.close() }
         var shouldContinue = true
         for chunk in chunkArray {
             let chunkCopy = IOCtl.SrvCopyChunkCopy(sourceKey: sourceKey.resumeKey, chunks: [chunk])
@@ -1606,7 +1618,7 @@ extension SMB2Manager {
                 shouldContinue =
                     progress(Int64(chunk.length), Int64(chunk.sourceOffset) + Int64(chunk.length), size) != nil
             }
-            
+
             if !shouldContinue {
                 break
             }
@@ -1618,8 +1630,10 @@ extension SMB2Manager {
         client: SMB2Client, fromPath path: String, toPath: String, progress: CopyProgressHandler
     ) throws -> Int64? {
         let fileRead = try SMB2FileHandle(forReadingAtPath: path, on: client)
+        defer { fileRead.close() }
         let size = try Int64(fileRead.fstat().smb2_size)
         let fileWrite = try SMB2FileHandle(forCreatingIfNotExistsAtPath: toPath, on: client)
+        defer { fileWrite.close() }
         var shouldContinue = true
         var written = 0
         while shouldContinue {
@@ -1663,6 +1677,7 @@ extension SMB2Manager {
         to stream: OutputStream, progress: ReadProgressHandler
     ) throws {
         let file = try SMB2FileHandle(forReadingAtPath: path, on: client)
+        defer { file.close() }
         let filesize = try Int64(file.fstat().smb2_size)
         let length = range.upperBound - range.lowerBound
         let size = min(length, filesize - range.lowerBound)
@@ -1705,6 +1720,7 @@ extension SMB2Manager {
         } else {
             file = try SMB2FileHandle(forCreatingIfNotExistsAtPath: toPath, on: client)
         }
+        defer { file.close() }
         let chunkSize = chunkSize > 0 ? chunkSize : file.optimizedWriteSize
         var totalWritten: UInt64 = 0
 
