@@ -18,6 +18,13 @@ import SMB2
 @objc(AMSMB2Manager)
 #endif
 public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomReflectable, @unchecked Sendable {
+    /// Whether an empty password requests a NULL session or authenticates the supplied user.
+    /// Nonempty passwords are unchanged. The default preserves the existing anonymous behavior.
+    public enum EmptyPasswordMode: String, Codable, Sendable {
+        case anonymous
+        case literal
+    }
+
     public typealias SimpleCompletionHandler = (@Sendable (_ error: (any Error)?) -> Void)?
     public typealias ReadProgressHandler = (@Sendable (_ bytes: Int64, _ total: Int64) -> Bool)?
     public typealias WriteProgressHandler = (@Sendable (_ bytes: Int64) -> Bool)?
@@ -28,6 +35,8 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
 
     /// SMB2 Share URL.
     public let url: URL
+
+    public let emptyPasswordMode: EmptyPasswordMode
 
     fileprivate let _domain: String
     fileprivate var _workstation: String
@@ -87,8 +96,9 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
        - url: SMB server's URL.
        - domain: User's domain, if applicable
        - credential: Username and password.
+       - emptyPasswordMode: Use `.literal` for a named user (including Guest) with an empty password.
      */
-    public init?(url: URL, domain: String = "", credential: URLCredential?) {
+    public init?(url: URL, domain: String = "", credential: URLCredential?, emptyPasswordMode: EmptyPasswordMode = .anonymous) {
         guard url.scheme?.lowercased() == "smb", url.host != nil else {
             return nil
         }
@@ -97,6 +107,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             label: "smb2_queue\(hostLabel)", qos: .default, attributes: .concurrent
         )
         self.url = url
+        self.emptyPasswordMode = emptyPasswordMode
 
         var domain = domain
         var workstation = ""
@@ -162,6 +173,12 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         self._password =
             aDecoder.decodeObject(of: NSString.self, forKey: CodingKeys.password.stringValue) as String? ?? ""
         self._timeout = aDecoder.decodeDouble(forKey: CodingKeys.timeout.stringValue)
+        if aDecoder.containsValue(forKey: CodingKeys.emptyPasswordMode.stringValue) {
+            self.emptyPasswordMode = (aDecoder.decodeObject(of: NSString.self, forKey: CodingKeys.emptyPasswordMode.stringValue) as String?)
+                .flatMap(EmptyPasswordMode.init(rawValue:)) ?? .anonymous
+        } else {
+            self.emptyPasswordMode = .anonymous
+        }
         super.init()
     }
 
@@ -172,6 +189,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         aCoder.encode(_user, forKey: CodingKeys.user.stringValue)
         aCoder.encode(_password, forKey: CodingKeys.password.stringValue)
         aCoder.encode(timeout, forKey: CodingKeys.timeout.stringValue)
+        aCoder.encode(emptyPasswordMode.rawValue, forKey: CodingKeys.emptyPasswordMode.stringValue)
     }
 
     public static var supportsSecureCoding: Bool {
@@ -180,7 +198,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
 
     enum CodingKeys: String, CodingKey {
         case url, domain, workstation
-        case user, password, timeout
+        case user, password, timeout, emptyPasswordMode
     }
 
     public required init(from decoder: any Decoder) throws {
@@ -202,6 +220,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         self._user = try container.decodeIfPresent(String.self, forKey: .user) ?? ""
         self._password = try container.decodeIfPresent(String.self, forKey: .password) ?? ""
         self._timeout = try container.decodeIfPresent(TimeInterval.self, forKey: .timeout) ?? 60
+        self.emptyPasswordMode = try container.decodeIfPresent(EmptyPasswordMode.self, forKey: .emptyPasswordMode) ?? .anonymous
         super.init()
     }
 
@@ -213,12 +232,14 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         try container.encode(_user, forKey: .user)
         try container.encode(_password, forKey: .password)
         try container.encode(timeout, forKey: .timeout)
+        try container.encode(emptyPasswordMode, forKey: .emptyPasswordMode)
     }
 
     open func copy(with _: NSZone? = nil) -> Any {
         let new = SMB2Manager(
             url: url, domain: _domain,
-            credential: URLCredential(user: _user, password: _password, persistence: .forSession)
+            credential: URLCredential(user: _user, password: _password, persistence: .forSession),
+            emptyPasswordMode: emptyPasswordMode
         )!
         new._workstation = _workstation
         new.timeout = timeout
@@ -1424,7 +1445,7 @@ extension SMB2Manager {
         }
     }
 
-    private func initClient(_ client: SMB2Client, encrypted: Bool) {
+    private func initClient(_ client: SMB2Client, encrypted: Bool) throws {
         client.securityMode = [.enabled]
         client.authentication = .ntlmSsp
         client.seal = encrypted
@@ -1432,14 +1453,14 @@ extension SMB2Manager {
         client.domain = _domain
         client.workstation = _workstation
         client.user = _user
-        client.password = _password
+        try client.setPassword(_password, emptyPasswordMode: emptyPasswordMode)
         client.timeout = _timeout
     }
 
     private func connect(shareName: String, encrypted: Bool) throws -> SMB2Client {
         let client = try SMB2Client(timeout: _timeout)
         self.client = client
-        initClient(client, encrypted: encrypted)
+        try initClient(client, encrypted: encrypted)
         let server = url.host! + (url.port.map { ":\($0)" } ?? "")
         let unsignedGuest = _user.caseInsensitiveCompare("guest") == .orderedSame
             && _password.isEmpty

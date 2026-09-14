@@ -142,6 +142,76 @@ final class CallbackLifetimeTests: XCTestCase {
         XCTAssertTrue(state.isClosed)
     }
 
+    func testLiteralEmptyPasswordIsNotANullSession() throws {
+        let client = try SMB2Client(timeout: 5)
+        client.user = "guest"
+        try client.setPassword("", emptyPasswordMode: .literal)
+        XCTAssertNotNil(client.context?.pointee.password)
+        XCTAssertEqual(client.password, "")
+        XCTAssertEqual(client.user, "guest")
+        try client.setPassword("", emptyPasswordMode: .anonymous)
+        XCTAssertNil(client.context?.pointee.password)
+        for mode in [SMB2Manager.EmptyPasswordMode.anonymous, .literal] {
+            try client.setPassword("test-password", emptyPasswordMode: mode)
+            XCTAssertEqual(client.password, "test-password")
+        }
+    }
+
+    func testEmptyPasswordModeSurvivesCopyAndSerialization() throws {
+        for mode in [SMB2Manager.EmptyPasswordMode.anonymous, .literal] {
+            let manager = try XCTUnwrap(SMB2Manager(
+                url: URL(string: "smb://127.0.0.1:49382")!,
+                credential: URLCredential(user: "guest", password: "", persistence: .none),
+                emptyPasswordMode: mode
+            ))
+            manager.timeout = 37
+            let json = try JSONEncoder().encode(manager)
+            let archive = try NSKeyedArchiver.archivedData(withRootObject: manager, requiringSecureCoding: true)
+            let restored = [
+                try XCTUnwrap(manager.copy() as? SMB2Manager),
+                try JSONDecoder().decode(SMB2Manager.self, from: json),
+                try XCTUnwrap(NSKeyedUnarchiver.unarchivedObject(ofClass: SMB2Manager.self, from: archive))
+            ]
+            for copy in restored {
+                XCTAssertEqual(copy.emptyPasswordMode, mode)
+                XCTAssertEqual(copy.url, manager.url)
+                XCTAssertEqual(copy.timeout, 37)
+            }
+        }
+        let legacyJSON = Data(#"{"url":"smb://127.0.0.1","user":"guest","password":""}"#.utf8)
+        XCTAssertEqual(try JSONDecoder().decode(SMB2Manager.self, from: legacyJSON).emptyPasswordMode, .anonymous)
+    }
+
+    func testExistingInitializersKeepAnonymousDefault() throws {
+        let url = try XCTUnwrap(URL(string: "smb://127.0.0.1"))
+        let credentials: [URLCredential?] = [nil,
+            URLCredential(user: "guest", password: "", persistence: .none),
+            URLCredential(user: "alice", password: "secret", persistence: .none)]
+        for credential in credentials {
+            XCTAssertEqual(try XCTUnwrap(SMB2Manager(url: url, credential: credential)).emptyPasswordMode, .anonymous)
+        }
+    }
+
+    func testLegacySecureArchiveWithoutModeKeepsAnonymousDefault() throws {
+        let manager = try XCTUnwrap(SMB2Manager(
+            url: URL(string: "smb://127.0.0.1")!, credential: nil, emptyPasswordMode: .literal))
+        let archive = try NSKeyedArchiver.archivedData(withRootObject: manager, requiringSecureCoding: true)
+        var plist = try XCTUnwrap(PropertyListSerialization.propertyList(from: archive, format: nil) as? [String: Any])
+        var objects = try XCTUnwrap(plist["$objects"] as? [Any])
+        var removedFields = 0
+        for index in objects.indices {
+            if var object = objects[index] as? [String: Any], object.removeValue(forKey: "emptyPasswordMode") != nil {
+                objects[index] = object
+                removedFields += 1
+            }
+        }
+        XCTAssertEqual(removedFields, 1, "Fixture must actually omit the new key, as old archives did")
+        plist["$objects"] = objects
+        let legacyArchive = try PropertyListSerialization.data(fromPropertyList: plist, format: .binary, options: 0)
+        let restored = try XCTUnwrap(NSKeyedUnarchiver.unarchivedObject(ofClass: SMB2Manager.self, from: legacyArchive))
+        XCTAssertEqual(restored.emptyPasswordMode, .anonymous)
+    }
+
     func testFileHandleCloseWaitsForActiveOperation() throws {
         let state = SMB2FileHandleState(handle: OpaquePointer(bitPattern: 0x5678))
         let operationStarted = DispatchSemaphore(value: 0)
