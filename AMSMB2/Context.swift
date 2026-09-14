@@ -208,9 +208,14 @@ extension SMB2Client {
             (context?.pointee.password).map(String.init(cString:)) ?? ""
         }
         set {
-            try? withThreadSafeContext { context in
-                smb2_set_password(context, newValue.isEmpty ? nil : newValue)
-            }
+            try? setPassword(newValue, emptyPasswordMode: .anonymous)
+        }
+    }
+
+    func setPassword(_ value: String, emptyPasswordMode: SMB2Manager.EmptyPasswordMode) throws {
+        try withThreadSafeContext { context in
+            // NULL means anonymous to libsmb2; "" must remain non-NULL for named Guest/NTLM.
+            smb2_set_password(context, value.isEmpty && emptyPasswordMode == .anonymous ? nil : value)
         }
     }
 

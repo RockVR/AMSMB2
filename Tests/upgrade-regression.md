@@ -1,5 +1,7 @@
 # AMSMB2 4.0.3 升级候选
 
+2026-09-14 补充：以下保留升级时的历史记录。原 guest 成功用例实际覆盖 Anonymous；现已新增显式字面空密码模式，最新合同和测试见 [Guest/Anonymous 兼容](guest-authentication.md)。
+
 状态：依赖自动化通过、App 集成验证中、待头显测试；2026-09-07。来源：用户要求从 main 独立升级，不创建 PR。
 
 基于上游 4.0.3；移植 RockVR guest tree connect 与 callback/handle 生命周期保护，适配 SMB2Client、新类型及 Swift 6，保留上游读取、锁和 lease 能力。libsmb2 采用 RockVR 固定提交，选择与排除依据见 Dependencies/libsmb2/tests/moon-client-regression.md。
